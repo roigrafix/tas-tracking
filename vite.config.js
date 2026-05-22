@@ -1,7 +1,23 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// https://vite.dev/config/
+// https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  server: {
+    proxy: {
+      // Proxy all /api requests to the Express backend during development
+      '/api': {
+        target:      'http://localhost:3001',
+        changeOrigin: true,
+        secure:       false,
+        // SSE needs these settings to stream properly
+        configure: (proxy) => {
+          proxy.on('proxyReq', (proxyReq) => {
+            proxyReq.setHeader('connection', 'keep-alive');
+          });
+        },
+      },
+    },
+  },
 })

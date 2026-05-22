@@ -1,26 +1,20 @@
 /**
  * AdminDashboard.jsx — TAS Tracking Application
- * ===============================================
- * Full admin control panel with:
- *  - Overview stats (active, delivered, processing, total)
- *  - Shipment management (create, update status, add log entries, delete)
- *  - RBAC panel (grant/revoke user access per shipment, toggle public)
- *  - User management overview
+ * ================================================
+ * Full admin control panel. Uses real API endpoints.
+ *
+ * Tabs:
+ *  1. Overview   — stats + recent shipments
+ *  2. Shipments  — full CRUD + log management
+ *  3. Access     — RBAC grant/revoke matrix
+ *  4. Users      — user listing
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import db from '../utils/mockDb';
+import { shipments as shipmentsApi, access as accessApi, users as usersApi, stats as statsApi } from '../utils/api';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-
-const STATUS_OPTIONS = [
-  { value: 'processing',       label: '📋 Order Processing' },
-  { value: 'in_transit',       label: '✈️ In Transit' },
-  { value: 'customs',          label: '🛃 Customs Clearance' },
-  { value: 'out_for_delivery', label: '🚚 Out for Delivery' },
-  { value: 'delivered',        label: '✅ Delivered' },
-];
-
+const STATUSES = ['processing', 'in_transit', 'customs', 'out_for_delivery', 'delivered'];
 const STATUS_LABELS = {
   processing:       'Processing',
   in_transit:       'In Transit',
@@ -29,498 +23,187 @@ const STATUS_LABELS = {
   delivered:        'Delivered',
 };
 
-function fmtDate(iso) {
-  return new Date(iso).toLocaleString('en-GB', {
-    day: '2-digit', month: 'short', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  });
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function Toast({ toasts }) {
+  return (
+    <div style={{ position: 'fixed', bottom: '2rem', right: '2rem', zIndex: 9999, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+      {toasts.map((t) => (
+        <div key={t.id} style={{
+          padding: '0.75rem 1.25rem', borderRadius: 10, fontWeight: 600, fontSize: '0.875rem',
+          background: t.type === 'error' ? 'rgba(239,68,68,0.15)' : 'rgba(37,99,235,0.15)',
+          border: `1px solid ${t.type === 'error' ? 'rgba(239,68,68,0.4)' : 'rgba(37,99,235,0.4)'}`,
+          color: t.type === 'error' ? '#fca5a5' : '#93c5fd',
+          backdropFilter: 'blur(10px)',
+          animation: 'fadeSlideIn 300ms ease',
+        }}>
+          {t.message}
+        </div>
+      ))}
+    </div>
+  );
 }
 
-// ── Toast Hook ────────────────────────────────────────────────────────────────
-function useToast() {
-  const [toasts, setToasts] = useState([]);
+// ── Main Component ────────────────────────────────────────────────────────────
+export default function AdminDashboard({ user, onLogout }) {
+  const [activeTab, setActiveTab]     = useState('overview');
+  const [shipmentList, setShipmentList] = useState([]);
+  const [userList, setUserList]       = useState([]);
+  const [accessList, setAccessList]   = useState([]);
+  const [statsData, setStatsData]     = useState({ total: 0, active: 0, delivered: 0, processing: 0 });
+  const [loading, setLoading]         = useState(false);
+  const [toasts, setToasts]           = useState([]);
 
-  const addToast = useCallback((message, type = 'success') => {
+  // Modal state
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showLogModal, setShowLogModal]       = useState(false);
+  const [editingShipment, setEditingShipment] = useState(null);
+  const [logTarget, setLogTarget]             = useState(null);
+  const [deleteTarget, setDeleteTarget]       = useState(null);
+
+  // Form state
+  const [createForm, setCreateForm] = useState({ description: '', origin: '', destination: '', vessel: '', weight: '', dimensions: '', recipient: '', estimated_delivery: '', isPublic: false });
+  const [logForm, setLogForm]       = useState({ event: '', location: '', note: '' });
+
+  // ── Toast helper ─────────────────────────────────────────────────────────
+  const toast = useCallback((message, type = 'info') => {
     const id = Date.now();
     setToasts((prev) => [...prev, { id, message, type }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3500);
   }, []);
 
-  return { toasts, addToast };
-}
-
-// ── Main Component ────────────────────────────────────────────────────────────
-export default function AdminDashboard({ user, onLogout }) {
-  const [activeTab, setActiveTab] = useState('overview');
-  const [shipments, setShipments] = useState([]);
-  const [users, setUsers]         = useState([]);
-  const [stats, setStats]         = useState({});
-  const { toasts, addToast }      = useToast();
-
-  // Form states
-  const [showCreateModal, setShowCreateModal]       = useState(false);
-  const [showUpdateModal, setShowUpdateModal]       = useState(false);
-  const [showLogModal, setShowLogModal]             = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm]   = useState(false);
-  const [selectedShipment, setSelectedShipment]     = useState(null);
-
-  // Create form
-  const [createForm, setCreateForm] = useState({
-    origin: '', destination: '', vessel: '', weight: '',
-    dimensions: '', estimatedDelivery: '', recipient: '',
-    description: '', status: 'processing', isPublic: false,
-  });
-
-  // Update form
-  const [updateForm, setUpdateForm] = useState({ status: '', vessel: '', estimatedDelivery: '' });
-
-  // Log form
-  const [logForm, setLogForm] = useState({ location: '', event: '', note: '' });
-
-  // ── Load data ───────────────────────────────────────────────────────────────
-  const refreshData = useCallback(() => {
-    setShipments(db.getShipments());
-    setUsers(db.getUsers().filter((u) => u.role === 'user')); // Only non-admin users
-    setStats(db.getStats());
-  }, []);
-
-  useEffect(() => { refreshData(); }, [refreshData]);
-
-  // ── Handlers ────────────────────────────────────────────────────────────────
-
-  /** Create a new shipment */
-  const handleCreate = (e) => {
-    e.preventDefault();
-    const ship = db.createShipment(createForm);
-    refreshData();
-    setShowCreateModal(false);
-    setCreateForm({
-      origin: '', destination: '', vessel: '', weight: '',
-      dimensions: '', estimatedDelivery: '', recipient: '',
-      description: '', status: 'processing', isPublic: false,
-    });
-    addToast(`Shipment ${ship.id} created successfully!`, 'success');
-  };
-
-  /** Update an existing shipment's status / details */
-  const handleUpdate = (e) => {
-    e.preventDefault();
-    db.updateShipment(selectedShipment.id, updateForm);
-    refreshData();
-    setShowUpdateModal(false);
-    addToast(`Shipment ${selectedShipment.id} updated.`, 'success');
-  };
-
-  /** Add a log entry to a shipment */
-  const handleAddLog = (e) => {
-    e.preventDefault();
-    db.addShipmentLog(selectedShipment.id, logForm);
-    refreshData();
-    setShowLogModal(false);
-    setLogForm({ location: '', event: '', note: '' });
-    addToast(`Log added to ${selectedShipment.id}.`, 'info');
-  };
-
-  /** Delete a shipment */
-  const handleDelete = () => {
-    db.deleteShipment(selectedShipment.id);
-    refreshData();
-    setShowDeleteConfirm(false);
-    addToast(`Shipment ${selectedShipment.id} deleted.`, 'error');
-  };
-
-  /** Toggle public access for a shipment */
-  const handleTogglePublic = (ship) => {
-    db.setShipmentPublic(ship.id, !ship.isPublic);
-    refreshData();
-    addToast(`${ship.id} set to ${!ship.isPublic ? 'Public' : 'Restricted'}.`, 'info');
-  };
-
-  /** Grant or revoke user access */
-  const handleToggleAccess = (userId, shipmentId, currentlyHas) => {
-    if (currentlyHas) {
-      db.revokeAccess(userId, shipmentId);
-      addToast('Access revoked.', 'error');
-    } else {
-      db.grantAccess(userId, shipmentId);
-      addToast('Access granted.', 'success');
+  // ── Data loading ──────────────────────────────────────────────────────────
+  const loadAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [s, u, a, st] = await Promise.all([
+        shipmentsApi.list(),
+        usersApi.list(),
+        accessApi.list(),
+        statsApi.get(),
+      ]);
+      setShipmentList(s);
+      setUserList(u);
+      setAccessList(a);
+      setStatsData(st);
+    } catch (err) {
+      toast(err.message || 'Failed to load data', 'error');
+    } finally {
+      setLoading(false);
     }
-    refreshData();
+  }, [toast]);
+
+  useEffect(() => { loadAll(); }, [loadAll]);
+
+  // ── Handlers ──────────────────────────────────────────────────────────────
+
+  const handleCreate = async (e) => {
+    e.preventDefault();
+    try {
+      await shipmentsApi.create(createForm);
+      toast('✅ Shipment created successfully');
+      setShowCreateModal(false);
+      setCreateForm({ description: '', origin: '', destination: '', vessel: '', weight: '', dimensions: '', recipient: '', estimated_delivery: '', isPublic: false });
+      loadAll();
+    } catch (err) { toast(err.message, 'error'); }
   };
 
-  // ── Render Tabs ─────────────────────────────────────────────────────────────
-  const TABS = [
-    { key: 'overview',   label: '📊 Overview' },
-    { key: 'shipments',  label: '📦 Shipments' },
-    { key: 'rbac',       label: '🔐 Access Control' },
-    { key: 'users',      label: '👥 Users' },
-  ];
-
-  // ── Overview Tab ─────────────────────────────────────────────────────────────
-  const renderOverview = () => (
-    <div style={{ animation: 'fadeSlideIn 300ms ease' }}>
-      {/* Stats Grid */}
-      <div className="grid-4 mb-8">
-        <StatCard icon="📦" iconClass="stat-icon--blue" value={stats.total || 0}     label="Total Shipments" />
-        <StatCard icon="✈️" iconClass="stat-icon--cyan" value={stats.active || 0}    label="Active Shipments" />
-        <StatCard icon="📋" iconClass="stat-icon--amber" value={stats.processing || 0} label="Processing" />
-        <StatCard icon="✅" iconClass="stat-icon--green" value={stats.delivered || 0} label="Delivered" />
-      </div>
-
-      {/* Recent Shipments Table */}
-      <div className="card">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="fw-700 text-lg">Recent Shipments</h3>
-          <button
-            id="quick-create-btn"
-            className="btn btn--primary btn--sm"
-            onClick={() => setShowCreateModal(true)}
-          >
-            + New Shipment
-          </button>
-        </div>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Tracking ID</th>
-                <th>Description</th>
-                <th>Route</th>
-                <th>Status</th>
-                <th>Access</th>
-                <th>Est. Delivery</th>
-              </tr>
-            </thead>
-            <tbody>
-              {shipments.slice(0, 5).map((ship) => (
-                <tr key={ship.id}>
-                  <td>
-                    <span className="mono-id">{ship.id}</span>
-                  </td>
-                  <td>{ship.description}</td>
-                  <td className="text-sm text-secondary">
-                    {ship.origin} → {ship.destination}
-                  </td>
-                  <td>
-                    <span className={`status-badge status-badge--${ship.status}`}>
-                      <span className="status-dot" />
-                      {STATUS_LABELS[ship.status]}
-                    </span>
-                  </td>
-                  <td>
-                    {ship.isPublic
-                      ? <span className="access-tag access-tag--public">🌐 Public</span>
-                      : <span className="access-tag access-tag--restricted">🔒 Restricted ({ship.allowedUsers.length})</span>
-                    }
-                  </td>
-                  <td className="text-sm">{ship.estimatedDelivery || '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        {shipments.length > 5 && (
-          <button className="btn btn--ghost btn--sm mt-4" onClick={() => setActiveTab('shipments')}>
-            View all {shipments.length} shipments →
-          </button>
-        )}
-      </div>
-    </div>
-  );
-
-  // ── Shipments Tab ─────────────────────────────────────────────────────────────
-  const renderShipments = () => (
-    <div style={{ animation: 'fadeSlideIn 300ms ease' }}>
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h2 className="section-title">Shipment Management</h2>
-          <p className="section-sub">Create, update, and manage all active cargo shipments.</p>
-        </div>
-        <button
-          id="create-shipment-btn"
-          className="btn btn--primary"
-          onClick={() => setShowCreateModal(true)}
-        >
-          + Create Shipment
-        </button>
-      </div>
-
-      <div className="card">
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Tracking ID</th>
-                <th>Description</th>
-                <th>Route</th>
-                <th>Status</th>
-                <th>Vessel</th>
-                <th>Est. Delivery</th>
-                <th>Access</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {shipments.length === 0 ? (
-                <tr>
-                  <td colSpan="8" style={{ textAlign: 'center', padding: '3rem', color: '#4a5a72' }}>
-                    No shipments yet. Create your first one!
-                  </td>
-                </tr>
-              ) : shipments.map((ship) => (
-                <tr key={ship.id}>
-                  <td><span className="mono-id">{ship.id}</span></td>
-                  <td className="text-sm">{ship.description}</td>
-                  <td className="text-sm text-secondary">
-                    <div>{ship.origin}</div>
-                    <div style={{ color: '#4a5a72' }}>→ {ship.destination}</div>
-                  </td>
-                  <td>
-                    <span className={`status-badge status-badge--${ship.status}`}>
-                      <span className="status-dot" />
-                      {STATUS_LABELS[ship.status]}
-                    </span>
-                  </td>
-                  <td className="text-sm text-secondary">{ship.vessel || '—'}</td>
-                  <td className="text-sm">{ship.estimatedDelivery || '—'}</td>
-                  <td>
-                    <label className="toggle" title={ship.isPublic ? 'Set Restricted' : 'Set Public'}>
-                      <input
-                        type="checkbox"
-                        checked={ship.isPublic}
-                        onChange={() => handleTogglePublic(ship)}
-                      />
-                      <span className="toggle-slider" />
-                    </label>
-                    <div className="text-xs text-muted" style={{ marginTop: 4 }}>
-                      {ship.isPublic ? '🌐 Public' : '🔒 Restricted'}
-                    </div>
-                  </td>
-                  <td>
-                    <div className="action-btns">
-                      <button
-                        className="btn btn--ghost btn--sm"
-                        title="Update status"
-                        onClick={() => {
-                          setSelectedShipment(ship);
-                          setUpdateForm({ status: ship.status, vessel: ship.vessel, estimatedDelivery: ship.estimatedDelivery });
-                          setShowUpdateModal(true);
-                        }}
-                      >
-                        ✏️
-                      </button>
-                      <button
-                        className="btn btn--accent btn--sm"
-                        title="Add event log"
-                        onClick={() => {
-                          setSelectedShipment(ship);
-                          setShowLogModal(true);
-                        }}
-                      >
-                        📝
-                      </button>
-                      <button
-                        className="btn btn--danger btn--sm"
-                        title="Delete shipment"
-                        onClick={() => {
-                          setSelectedShipment(ship);
-                          setShowDeleteConfirm(true);
-                        }}
-                      >
-                        🗑️
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  );
-
-  // ── RBAC Tab ─────────────────────────────────────────────────────────────────
-  const renderRBAC = () => (
-    <div style={{ animation: 'fadeSlideIn 300ms ease' }}>
-      <h2 className="section-title">Access Control (RBAC)</h2>
-      <p className="section-sub">
-        Grant or revoke user access to specific shipments. Toggle cells to manage permissions.
-        Public shipments are visible to all logged-in users.
-      </p>
-
-      {users.length === 0 || shipments.length === 0 ? (
-        <div className="empty-state">
-          <div className="empty-icon">🔐</div>
-          <p className="fw-600">No users or shipments to manage yet.</p>
-        </div>
-      ) : (
-        <div className="card">
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th style={{ minWidth: 160 }}>User</th>
-                  {shipments.map((ship) => (
-                    <th key={ship.id} style={{ minWidth: 130, textAlign: 'center' }}>
-                      <div className="mono-id-sm">{ship.id}</div>
-                      <div className="text-xs text-muted" style={{ fontWeight: 400, marginTop: 2 }}>
-                        {ship.isPublic
-                          ? <span style={{ color: '#22d3ee' }}>🌐 Public</span>
-                          : '🔒 Restricted'}
-                      </div>
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {users.map((u) => (
-                  <tr key={u.id}>
-                    <td>
-                      <div className="flex items-center gap-2">
-                        <div className="navbar-avatar" style={{ width: 28, height: 28, fontSize: '0.7rem' }}>
-                          {u.name[0]}
-                        </div>
-                        <div>
-                          <div className="text-sm fw-600">{u.name}</div>
-                          <div className="text-xs text-muted">{u.email}</div>
-                        </div>
-                      </div>
-                    </td>
-                    {shipments.map((ship) => {
-                      const hasAccess = ship.isPublic || ship.allowedUsers.includes(u.id);
-                      const isPublic  = ship.isPublic;
-                      return (
-                        <td key={ship.id} style={{ textAlign: 'center' }}>
-                          {isPublic ? (
-                            <span className="rbac-cell rbac-cell--public" title="Public shipment — accessible to all">
-                              🌐
-                            </span>
-                          ) : (
-                            <button
-                              className={`rbac-toggle-btn ${hasAccess ? 'rbac-toggle-btn--granted' : 'rbac-toggle-btn--denied'}`}
-                              onClick={() => handleToggleAccess(u.id, ship.id, hasAccess)}
-                              title={hasAccess ? 'Click to revoke access' : 'Click to grant access'}
-                            >
-                              {hasAccess ? '✓ Granted' : '✕ Denied'}
-                            </button>
-                          )}
-                        </td>
-                      );
-                    })}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-
-  // ── Users Tab ─────────────────────────────────────────────────────────────────
-  const renderUsers = () => {
-    const allUsers = db.getUsers();
-    return (
-      <div style={{ animation: 'fadeSlideIn 300ms ease' }}>
-        <h2 className="section-title">User Accounts</h2>
-        <p className="section-sub">All registered users on the TAS platform.</p>
-        <div className="card">
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Email</th>
-                  <th>Role</th>
-                  <th>Member Since</th>
-                  <th>Accessible Shipments</th>
-                </tr>
-              </thead>
-              <tbody>
-                {allUsers.map((u) => {
-                  const accessible = u.role === 'admin'
-                    ? shipments.length
-                    : shipments.filter((s) => s.isPublic || s.allowedUsers.includes(u.id)).length;
-                  return (
-                    <tr key={u.id}>
-                      <td>
-                        <div className="flex items-center gap-3">
-                          <div className="navbar-avatar" style={{ width: 32, height: 32, fontSize: '0.75rem' }}>
-                            {u.name[0]}
-                          </div>
-                          <span className="fw-600 text-sm">{u.name}</span>
-                        </div>
-                      </td>
-                      <td className="text-secondary text-sm">{u.email}</td>
-                      <td>
-                        <span className={`role-badge ${u.role === 'admin' ? 'role-badge--admin' : 'role-badge--user'}`}>
-                          {u.role === 'admin' ? '🛡️ Admin' : '👤 User'}
-                        </span>
-                      </td>
-                      <td className="text-sm text-secondary">{fmtDate(u.createdAt)}</td>
-                      <td>
-                        <span className="text-sm fw-600" style={{ color: '#60a5fa' }}>
-                          {accessible} shipment{accessible !== 1 ? 's' : ''}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    );
+  const handleStatusUpdate = async (id, status) => {
+    try {
+      await shipmentsApi.update(id, { status });
+      toast(`📦 Status updated to ${STATUS_LABELS[status]}`);
+      loadAll();
+    } catch (err) { toast(err.message, 'error'); }
   };
 
-  // ── Main Render ───────────────────────────────────────────────────────────────
+  const handleDelete = async (id) => {
+    try {
+      await shipmentsApi.delete(id);
+      toast(`🗑️ Shipment ${id} deleted`);
+      setDeleteTarget(null);
+      loadAll();
+    } catch (err) { toast(err.message, 'error'); }
+  };
+
+  const handleAddLog = async (e) => {
+    e.preventDefault();
+    try {
+      await shipmentsApi.addLog(logTarget.id, logForm);
+      toast('📋 Log entry added');
+      setShowLogModal(false);
+      setLogForm({ event: '', location: '', note: '' });
+      loadAll();
+    } catch (err) { toast(err.message, 'error'); }
+  };
+
+  const handleTogglePublic = async (id, current) => {
+    try {
+      await shipmentsApi.setPublic(id, !current);
+      toast(`🌐 Shipment set to ${!current ? 'Public' : 'Restricted'}`);
+      loadAll();
+    } catch (err) { toast(err.message, 'error'); }
+  };
+
+  const handleGrant = async (userId, shipmentId) => {
+    try {
+      await accessApi.grant(userId, shipmentId);
+      toast('✅ Access granted');
+      loadAll();
+    } catch (err) { toast(err.message, 'error'); }
+  };
+
+  const handleRevoke = async (userId, shipmentId) => {
+    try {
+      await accessApi.revoke(userId, shipmentId);
+      toast('🔒 Access revoked');
+      loadAll();
+    } catch (err) { toast(err.message, 'error'); }
+  };
+
+  // ── Render helpers ────────────────────────────────────────────────────────
+
+  const hasAccess = (userId, shipmentId) =>
+    accessList.some((a) => a.user_id === userId && a.shipment_id === shipmentId);
+
+  const regularUsers = userList.filter((u) => u.role === 'user');
+  const privateShipments = shipmentList.filter((s) => !s.is_public);
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="app-root">
       <div className="app-bg" />
+      <Toast toasts={toasts} />
 
       {/* Navbar */}
       <nav className="navbar">
         <div className="navbar-brand">
           <div className="navbar-logo">TAS</div>
-          <div>
-            <div className="navbar-name">TAS</div>
-            <div className="navbar-tagline">Admin Control Panel</div>
-          </div>
+          <div><div className="navbar-name">TAS</div><div className="navbar-tagline">Admin Panel</div></div>
         </div>
         <div className="navbar-actions">
           <div className="navbar-user">
-            <div className="navbar-avatar">{user.name[0]}</div>
-            <span>{user.name}</span>
-            <span className="role-badge role-badge--admin">Admin</span>
+            <div className="navbar-avatar" style={{ background: 'linear-gradient(135deg,#7c3aed,#a855f7)' }}>
+              {user.name[0].toUpperCase()}
+            </div>
+            <div>
+              <div className="navbar-user-name">{user.name}</div>
+              <div className="navbar-user-role" style={{ color: '#a78bfa' }}>Administrator</div>
+            </div>
           </div>
-          <button id="admin-logout-btn" className="btn btn--ghost btn--sm" onClick={onLogout}>
-            Sign Out
-          </button>
+          <button className="btn btn--ghost btn--sm" onClick={onLogout}>Sign Out</button>
         </div>
       </nav>
 
-      {/* Page content */}
-      <div className="page-content" style={{ position: 'relative', zIndex: 1 }}>
-
-        {/* Page title */}
-        <div className="admin-page-header">
-          <div>
-            <h1 className="admin-page-title">Admin Dashboard</h1>
-            <p className="text-secondary text-sm">Manage shipments, users, and access control for TAS.</p>
-          </div>
-          <div className="admin-header-time">
-            {new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
-          </div>
-        </div>
-
-        {/* Tabs */}
-        <div className="tabs mb-6">
-          {TABS.map((tab) => (
+      <div className="page-content">
+        {/* Tab bar */}
+        <div className="tab-bar">
+          {[
+            { key: 'overview',  label: '📊 Overview' },
+            { key: 'shipments', label: '📦 Shipments' },
+            { key: 'access',    label: '🔑 Access Control' },
+            { key: 'users',     label: '👥 Users' },
+          ].map((tab) => (
             <button
               key={tab.key}
-              id={`tab-${tab.key}`}
               className={`tab-btn ${activeTab === tab.key ? 'tab-btn--active' : ''}`}
               onClick={() => setActiveTab(tab.key)}
             >
@@ -529,121 +212,285 @@ export default function AdminDashboard({ user, onLogout }) {
           ))}
         </div>
 
-        {/* Tab content */}
-        {activeTab === 'overview'  && renderOverview()}
-        {activeTab === 'shipments' && renderShipments()}
-        {activeTab === 'rbac'      && renderRBAC()}
-        {activeTab === 'users'     && renderUsers()}
+        {loading && (
+          <div style={{ textAlign: 'center', padding: '3rem', color: '#4a5a72' }}>
+            <div className="spinner" style={{ width: 32, height: 32, margin: '0 auto 1rem', border: '3px solid rgba(37,99,235,0.2)', borderTopColor: '#2563eb' }} />
+            Loading…
+          </div>
+        )}
+
+        {/* ── Overview Tab ── */}
+        {!loading && activeTab === 'overview' && (
+          <div>
+            <div className="stats-grid mb-6">
+              {[
+                { label: 'Total Shipments', value: statsData.total,      icon: '📦', color: '#2563eb' },
+                { label: 'Active',          value: statsData.active,     icon: '✈️', color: '#06b6d4' },
+                { label: 'Processing',      value: statsData.processing, icon: '⚙️', color: '#f59e0b' },
+                { label: 'Delivered',       value: statsData.delivered,  icon: '✅', color: '#10b981' },
+              ].map((stat) => (
+                <div key={stat.label} className="stat-card card">
+                  <div className="stat-icon" style={{ color: stat.color }}>{stat.icon}</div>
+                  <div className="stat-value">{stat.value}</div>
+                  <div className="stat-label">{stat.label}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="card">
+              <h3 className="card-section-title">📦 Recent Shipments</h3>
+              <div className="admin-table-wrap">
+                <table className="admin-table">
+                  <thead>
+                    <tr>
+                      <th>Tracking ID</th><th>Description</th><th>Status</th><th>Origin</th><th>Destination</th><th>Visibility</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {shipmentList.slice(0, 8).map((s) => (
+                      <tr key={s.id}>
+                        <td><code>{s.id}</code></td>
+                        <td>{s.description}</td>
+                        <td><span className={`status-badge status-badge--${s.status}`}><span className="status-dot" />{STATUS_LABELS[s.status]}</span></td>
+                        <td>{s.origin}</td>
+                        <td>{s.destination}</td>
+                        <td>{s.is_public ? '🌐 Public' : '🔒 Private'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Shipments Tab ── */}
+        {!loading && activeTab === 'shipments' && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '1rem' }}>
+              <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#f0f6ff' }}>Shipment Management</h2>
+              <button className="btn btn--primary" onClick={() => setShowCreateModal(true)}>+ New Shipment</button>
+            </div>
+
+            <div className="card">
+              <div className="admin-table-wrap">
+                <table className="admin-table">
+                  <thead>
+                    <tr>
+                      <th>ID</th><th>Description</th><th>Status</th><th>Visibility</th><th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {shipmentList.map((s) => (
+                      <tr key={s.id}>
+                        <td><code style={{ fontSize: '0.8rem' }}>{s.id}</code></td>
+                        <td>{s.description}</td>
+                        <td>
+                          <select
+                            className="form-input"
+                            style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
+                            value={s.status}
+                            onChange={(e) => handleStatusUpdate(s.id, e.target.value)}
+                          >
+                            {STATUSES.map((st) => <option key={st} value={st}>{STATUS_LABELS[st]}</option>)}
+                          </select>
+                        </td>
+                        <td>
+                          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.8rem' }}>
+                            <input type="checkbox" checked={Boolean(s.is_public)} onChange={() => handleTogglePublic(s.id, s.is_public)} />
+                            {s.is_public ? '🌐 Public' : '🔒 Private'}
+                          </label>
+                        </td>
+                        <td>
+                          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                            <button className="btn btn--ghost btn--sm" onClick={() => { setLogTarget(s); setShowLogModal(true); }}>+ Log</button>
+                            <button className="btn btn--sm" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', color: '#fca5a5' }} onClick={() => setDeleteTarget(s.id)}>🗑️</button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Access Control Tab ── */}
+        {!loading && activeTab === 'access' && (
+          <div>
+            <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#f0f6ff', marginBottom: '0.5rem' }}>Access Control Matrix</h2>
+            <p style={{ fontSize: '0.875rem', color: '#64748b', marginBottom: '1.5rem' }}>
+              Click a cell to grant or revoke a user's access to a private shipment. Public shipments (🌐) are accessible to everyone.
+            </p>
+            <div className="card">
+              <div className="admin-table-wrap">
+                <table className="admin-table">
+                  <thead>
+                    <tr>
+                      <th>User</th>
+                      {privateShipments.map((s) => (
+                        <th key={s.id} style={{ fontSize: '0.7rem', maxWidth: 100 }}>
+                          <code>{s.id}</code>
+                          <div style={{ color: '#4a5a72', fontWeight: 400 }}>{s.description?.slice(0, 20)}</div>
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {regularUsers.map((u) => (
+                      <tr key={u.id}>
+                        <td>
+                          <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{u.name}</div>
+                          <div style={{ fontSize: '0.75rem', color: '#4a5a72' }}>{u.email}</div>
+                        </td>
+                        {privateShipments.map((s) => {
+                          const granted = hasAccess(u.id, s.id);
+                          return (
+                            <td key={s.id} style={{ textAlign: 'center' }}>
+                              <button
+                                onClick={() => granted ? handleRevoke(u.id, s.id) : handleGrant(u.id, s.id)}
+                                style={{
+                                  background: granted ? 'rgba(16,185,129,0.15)' : 'rgba(99,162,255,0.05)',
+                                  border: `1px solid ${granted ? 'rgba(16,185,129,0.4)' : 'rgba(99,162,255,0.15)'}`,
+                                  borderRadius: 6, padding: '0.3rem 0.6rem', cursor: 'pointer',
+                                  color: granted ? '#6ee7b7' : '#4a5a72', fontSize: '1rem',
+                                  transition: 'all 150ms', minWidth: 36
+                                }}
+                                title={granted ? 'Click to revoke' : 'Click to grant'}
+                              >
+                                {granted ? '✓' : '–'}
+                              </button>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                    {regularUsers.length === 0 && (
+                      <tr><td colSpan={privateShipments.length + 1} style={{ textAlign: 'center', color: '#4a5a72' }}>No regular users found.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Users Tab ── */}
+        {!loading && activeTab === 'users' && (
+          <div>
+            <h2 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#f0f6ff', marginBottom: '1.5rem' }}>User Management</h2>
+            <div className="card">
+              <div className="admin-table-wrap">
+                <table className="admin-table">
+                  <thead>
+                    <tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Joined</th><th>Access Count</th></tr>
+                  </thead>
+                  <tbody>
+                    {userList.map((u) => {
+                      const accessCount = accessList.filter((a) => a.user_id === u.id).length;
+                      return (
+                        <tr key={u.id}>
+                          <td style={{ fontWeight: 600 }}>{u.name}</td>
+                          <td style={{ color: '#64748b' }}>{u.email}</td>
+                          <td>
+                            <span style={{
+                              padding: '2px 10px', borderRadius: 999, fontSize: '0.7rem', fontWeight: 700,
+                              background: u.role === 'admin' ? 'rgba(139,92,246,0.15)' : 'rgba(6,182,212,0.1)',
+                              border: `1px solid ${u.role === 'admin' ? 'rgba(139,92,246,0.4)' : 'rgba(6,182,212,0.3)'}`,
+                              color: u.role === 'admin' ? '#c4b5fd' : '#67e8f9',
+                            }}>
+                              {u.role === 'admin' ? '🛡️ Admin' : '👤 User'}
+                            </span>
+                          </td>
+                          <td>
+                            <span style={{ color: u.is_active ? '#6ee7b7' : '#fca5a5', fontSize: '0.8rem', fontWeight: 600 }}>
+                              {u.is_active ? '● Active' : '○ Inactive'}
+                            </span>
+                          </td>
+                          <td style={{ color: '#64748b', fontSize: '0.8rem' }}>
+                            {new Date(u.created_at).toLocaleDateString('en-GB')}
+                          </td>
+                          <td style={{ textAlign: 'center' }}>
+                            <span style={{ background: 'rgba(37,99,235,0.1)', border: '1px solid rgba(37,99,235,0.25)', color: '#93c5fd', padding: '2px 10px', borderRadius: 999, fontSize: '0.75rem', fontWeight: 700 }}>
+                              {accessCount}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* ── Create Shipment Modal ─────────────────────────────────────────────── */}
+      {/* ── Create Shipment Modal ── */}
       {showCreateModal && (
         <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
-          <div className="modal-box" style={{ maxWidth: 580 }} onClick={(e) => e.stopPropagation()}>
-            <h2 className="modal-title">📦 Create New Shipment</h2>
-            <form onSubmit={handleCreate}>
-              <div className="modal-form-grid">
-                <FormField label="Origin *"          id="cf-origin"      value={createForm.origin}      onChange={(v) => setCreateForm({...createForm, origin: v})}      placeholder="e.g. Dubai, UAE" required />
-                <FormField label="Destination *"     id="cf-dest"        value={createForm.destination} onChange={(v) => setCreateForm({...createForm, destination: v})} placeholder="e.g. London, UK" required />
-                <FormField label="Vessel / Flight"   id="cf-vessel"      value={createForm.vessel}      onChange={(v) => setCreateForm({...createForm, vessel: v})}      placeholder="e.g. Emirates EK-007" />
-                <FormField label="Est. Delivery"     id="cf-delivery"    type="date" value={createForm.estimatedDelivery} onChange={(v) => setCreateForm({...createForm, estimatedDelivery: v})} />
-                <FormField label="Weight"            id="cf-weight"      value={createForm.weight}      onChange={(v) => setCreateForm({...createForm, weight: v})}      placeholder="e.g. 120 kg" />
-                <FormField label="Dimensions"        id="cf-dims"        value={createForm.dimensions}  onChange={(v) => setCreateForm({...createForm, dimensions: v})}  placeholder="e.g. 80 × 60 × 50 cm" />
-                <FormField label="Recipient"         id="cf-recipient"   value={createForm.recipient}   onChange={(v) => setCreateForm({...createForm, recipient: v})}   placeholder="Company or person name" />
-                <FormField label="Description *"     id="cf-desc"        value={createForm.description} onChange={(v) => setCreateForm({...createForm, description: v})} placeholder="e.g. Electronic Components" required />
-              </div>
-              <div className="form-group mb-4">
-                <label className="form-label">Initial Status</label>
-                <select
-                  className="form-select"
-                  value={createForm.status}
-                  onChange={(e) => setCreateForm({...createForm, status: e.target.value})}
-                >
-                  {STATUS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-              <label className="form-checkbox-row mb-4">
-                <input
-                  type="checkbox"
-                  checked={createForm.isPublic}
-                  onChange={(e) => setCreateForm({...createForm, isPublic: e.target.checked})}
-                />
-                <span className="text-sm fw-600">Make shipment publicly visible (no RBAC required)</span>
-              </label>
-              <div className="flex gap-3">
-                <button type="submit" className="btn btn--primary" style={{ flex: 1 }}>
-                  Create Shipment
-                </button>
-                <button type="button" className="btn btn--ghost" onClick={() => setShowCreateModal(false)}>
-                  Cancel
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* ── Update Shipment Modal ─────────────────────────────────────────────── */}
-      {showUpdateModal && selectedShipment && (
-        <div className="modal-overlay" onClick={() => setShowUpdateModal(false)}>
-          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
-            <h2 className="modal-title">✏️ Update Shipment</h2>
-            <p className="text-secondary text-sm mb-4">
-              Editing: <span className="mono-id">{selectedShipment.id}</span>
-            </p>
-            <form onSubmit={handleUpdate}>
-              <div className="form-group mb-4">
-                <label className="form-label">Status</label>
-                <select
-                  className="form-select"
-                  value={updateForm.status}
-                  onChange={(e) => setUpdateForm({...updateForm, status: e.target.value})}
-                >
-                  {STATUS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-                </select>
-              </div>
-              <FormField label="Vessel / Flight" id="uf-vessel" value={updateForm.vessel} onChange={(v) => setUpdateForm({...updateForm, vessel: v})} placeholder="Update vessel or flight number" />
-              <div className="form-group mb-4" style={{ marginTop: '1rem' }}>
+          <div className="modal-box" style={{ maxWidth: 540 }} onClick={(e) => e.stopPropagation()}>
+            <h2 className="modal-title">New Shipment</h2>
+            <form onSubmit={handleCreate} style={{ display: 'flex', flexDirection: 'column', gap: '0.875rem' }}>
+              {[
+                ['Description', 'description', 'e.g. Electronic Components', true],
+                ['Origin', 'origin', 'e.g. Dubai, UAE', false],
+                ['Destination', 'destination', 'e.g. London, UK', false],
+                ['Recipient', 'recipient', 'e.g. Company Name', false],
+                ['Vessel / Flight', 'vessel', 'e.g. Emirates EK-007', false],
+                ['Weight', 'weight', 'e.g. 120 kg', false],
+                ['Dimensions', 'dimensions', 'e.g. 80 × 60 × 50 cm', false],
+              ].map(([label, key, placeholder, required]) => (
+                <div key={key}>
+                  <label className="form-label">{label}{required && ' *'}</label>
+                  <input
+                    className="form-input"
+                    placeholder={placeholder}
+                    value={createForm[key]}
+                    onChange={(e) => setCreateForm({ ...createForm, [key]: e.target.value })}
+                    required={required}
+                  />
+                </div>
+              ))}
+              <div>
                 <label className="form-label">Est. Delivery Date</label>
-                <input type="date" className="form-input" value={updateForm.estimatedDelivery} onChange={(e) => setUpdateForm({...updateForm, estimatedDelivery: e.target.value})} />
+                <input type="date" className="form-input" value={createForm.estimated_delivery} onChange={(e) => setCreateForm({ ...createForm, estimated_delivery: e.target.value })} />
               </div>
-              <div className="flex gap-3">
-                <button type="submit" className="btn btn--primary" style={{ flex: 1 }}>Save Changes</button>
-                <button type="button" className="btn btn--ghost" onClick={() => setShowUpdateModal(false)}>Cancel</button>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.625rem', cursor: 'pointer', fontSize: '0.875rem', color: '#94a3b8' }}>
+                <input type="checkbox" checked={createForm.isPublic} onChange={(e) => setCreateForm({ ...createForm, isPublic: e.target.checked })} />
+                Make this shipment publicly trackable (no login required)
+              </label>
+              <div className="flex gap-3" style={{ marginTop: '0.5rem' }}>
+                <button type="submit" className="btn btn--primary" style={{ flex: 1 }}>Create Shipment</button>
+                <button type="button" className="btn btn--ghost" onClick={() => setShowCreateModal(false)}>Cancel</button>
               </div>
             </form>
           </div>
         </div>
       )}
 
-      {/* ── Add Log Modal ─────────────────────────────────────────────────────── */}
-      {showLogModal && selectedShipment && (
+      {/* ── Add Log Modal ── */}
+      {showLogModal && logTarget && (
         <div className="modal-overlay" onClick={() => setShowLogModal(false)}>
           <div className="modal-box" onClick={(e) => e.stopPropagation()}>
-            <h2 className="modal-title">📝 Add Event Log</h2>
-            <p className="text-secondary text-sm mb-4">
-              Adding log to: <span className="mono-id">{selectedShipment.id}</span>
-            </p>
-            <form onSubmit={handleAddLog}>
-              <FormField label="Location *"    id="lf-loc"   value={logForm.location} onChange={(v) => setLogForm({...logForm, location: v})} placeholder="e.g. Frankfurt Airport" required />
-              <div style={{ marginTop: '1rem' }}>
-                <div className="form-group mb-4">
-                  <label className="form-label">Event *</label>
-                  <select className="form-select" value={logForm.event} onChange={(e) => setLogForm({...logForm, event: e.target.value})} required>
-                    <option value="">Select event type…</option>
-                    <option>Order Processed</option>
-                    <option>In Transit</option>
-                    <option>Customs Clearance</option>
-                    <option>Out for Delivery</option>
-                    <option>Delivered</option>
-                    <option>Delay Notice</option>
-                    <option>Exception</option>
-                  </select>
-                </div>
+            <h2 className="modal-title">Add Log Entry</h2>
+            <p style={{ fontSize: '0.8rem', color: '#4a5a72', marginBottom: '1rem' }}>For: <code>{logTarget.id}</code></p>
+            <form onSubmit={handleAddLog} style={{ display: 'flex', flexDirection: 'column', gap: '0.875rem' }}>
+              <div>
+                <label className="form-label">Event *</label>
+                <input className="form-input" placeholder="e.g. In Transit" value={logForm.event} onChange={(e) => setLogForm({ ...logForm, event: e.target.value })} required />
               </div>
-              <FormField label="Note" id="lf-note" value={logForm.note} onChange={(v) => setLogForm({...logForm, note: v})} placeholder="Optional details about this event" />
-              <div className="flex gap-3" style={{ marginTop: '1.25rem' }}>
-                <button type="submit" className="btn btn--accent" style={{ flex: 1 }}>Add Log Entry</button>
+              <div>
+                <label className="form-label">Location</label>
+                <input className="form-input" placeholder="e.g. Dubai International Airport" value={logForm.location} onChange={(e) => setLogForm({ ...logForm, location: e.target.value })} />
+              </div>
+              <div>
+                <label className="form-label">Note</label>
+                <input className="form-input" placeholder="Additional details…" value={logForm.note} onChange={(e) => setLogForm({ ...logForm, note: e.target.value })} />
+              </div>
+              <div className="flex gap-3">
+                <button type="submit" className="btn btn--primary" style={{ flex: 1 }}>Add Entry</button>
                 <button type="button" className="btn btn--ghost" onClick={() => setShowLogModal(false)}>Cancel</button>
               </div>
             </form>
@@ -651,206 +498,46 @@ export default function AdminDashboard({ user, onLogout }) {
         </div>
       )}
 
-      {/* ── Delete Confirm Modal ──────────────────────────────────────────────── */}
-      {showDeleteConfirm && selectedShipment && (
-        <div className="modal-overlay" onClick={() => setShowDeleteConfirm(false)}>
+      {/* ── Delete Confirmation Modal ── */}
+      {deleteTarget && (
+        <div className="modal-overlay" onClick={() => setDeleteTarget(null)}>
           <div className="modal-box" onClick={(e) => e.stopPropagation()}>
-            <div style={{ fontSize: '2.5rem', textAlign: 'center', marginBottom: '1rem' }}>⚠️</div>
-            <h2 className="modal-title" style={{ textAlign: 'center' }}>Delete Shipment?</h2>
-            <p className="text-secondary text-sm mb-6" style={{ textAlign: 'center' }}>
-              This will permanently delete shipment <strong>{selectedShipment.id}</strong> and all its logs. This action cannot be undone.
+            <div style={{ fontSize: '2.5rem', marginBottom: '0.75rem', textAlign: 'center' }}>⚠️</div>
+            <h2 className="modal-title">Delete Shipment?</h2>
+            <p style={{ textAlign: 'center', color: '#64748b', marginBottom: '1.5rem', fontSize: '0.875rem' }}>
+              This will permanently delete <strong>{deleteTarget}</strong> and all its logs. This cannot be undone.
             </p>
             <div className="flex gap-3">
-              <button className="btn btn--danger" style={{ flex: 1 }} onClick={handleDelete}>
+              <button className="btn btn--sm" style={{ flex: 1, background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.4)', color: '#fca5a5' }} onClick={() => handleDelete(deleteTarget)}>
                 Yes, Delete
               </button>
-              <button className="btn btn--ghost" style={{ flex: 1 }} onClick={() => setShowDeleteConfirm(false)}>
-                Cancel
-              </button>
+              <button className="btn btn--ghost" style={{ flex: 1 }} onClick={() => setDeleteTarget(null)}>Cancel</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ── Toast Notifications ───────────────────────────────────────────────── */}
-      <div className="toast-container">
-        {toasts.map((t) => (
-          <div key={t.id} className={`toast toast--${t.type}`}>
-            <span>{t.type === 'success' ? '✅' : t.type === 'error' ? '❌' : 'ℹ️'}</span>
-            {t.message}
-          </div>
-        ))}
-      </div>
-
-      {/* Inline admin styles */}
       <style>{`
-        @keyframes fadeSlideIn {
-          from { opacity: 0; transform: translateY(12px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-
-        .admin-page-header {
-          display: flex;
-          align-items: flex-start;
-          justify-content: space-between;
-          margin-bottom: 1.75rem;
-          flex-wrap: wrap;
-          gap: 1rem;
-        }
-
-        .admin-page-title {
-          font-size: 1.875rem;
-          font-weight: 900;
-          background: linear-gradient(135deg, #f0f6ff, #93c5fd);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-          background-clip: text;
-        }
-
-        .admin-header-time {
-          font-size: 0.8rem;
-          color: #334155;
-          padding: 0.5rem 1rem;
-          background: rgba(255,255,255,0.03);
-          border: 1px solid rgba(99,162,255,0.1);
-          border-radius: 8px;
-        }
-
-        .mono-id {
-          font-family: 'Inter', monospace;
-          font-size: 0.8rem;
-          font-weight: 700;
-          letter-spacing: 0.06em;
-          color: #60a5fa;
-          background: rgba(37,99,235,0.1);
-          padding: 2px 8px;
-          border-radius: 4px;
-        }
-
-        .mono-id-sm {
-          font-family: 'Inter', monospace;
-          font-size: 0.7rem;
-          font-weight: 700;
-          letter-spacing: 0.05em;
-          color: #60a5fa;
-        }
-
-        .access-tag {
-          display: inline-block;
-          font-size: 0.7rem;
-          font-weight: 600;
-          padding: 2px 8px;
-          border-radius: 999px;
-          white-space: nowrap;
-        }
-
-        .access-tag--public {
-          background: rgba(6,182,212,0.1);
-          color: #67e8f9;
-          border: 1px solid rgba(6,182,212,0.25);
-        }
-
-        .access-tag--restricted {
-          background: rgba(245,158,11,0.1);
-          color: #fcd34d;
-          border: 1px solid rgba(245,158,11,0.25);
-        }
-
-        .action-btns {
-          display: flex;
-          gap: 0.375rem;
-          align-items: center;
-        }
-
-        .rbac-cell {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 1rem;
-          padding: 0.25rem;
-        }
-
-        .rbac-cell--public { color: #22d3ee; }
-
-        .rbac-toggle-btn {
-          padding: 0.25rem 0.75rem;
-          border-radius: 6px;
-          font-size: 0.7rem;
-          font-weight: 700;
-          cursor: pointer;
-          border: 1px solid;
-          font-family: 'Inter', sans-serif;
-          transition: all 200ms ease;
-          white-space: nowrap;
-        }
-
-        .rbac-toggle-btn--granted {
-          background: rgba(16,185,129,0.15);
-          border-color: rgba(16,185,129,0.35);
-          color: #6ee7b7;
-        }
-
-        .rbac-toggle-btn--granted:hover {
-          background: rgba(239,68,68,0.1);
-          border-color: rgba(239,68,68,0.3);
-          color: #fca5a5;
-        }
-
-        .rbac-toggle-btn--denied {
-          background: rgba(239,68,68,0.1);
-          border-color: rgba(239,68,68,0.25);
-          color: #fca5a5;
-        }
-
-        .rbac-toggle-btn--denied:hover {
-          background: rgba(16,185,129,0.15);
-          border-color: rgba(16,185,129,0.3);
-          color: #6ee7b7;
-        }
-
-        .modal-form-grid {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 0.75rem 1rem;
-          margin-bottom: 1rem;
-        }
-
-        @media (max-width: 640px) {
-          .modal-form-grid { grid-template-columns: 1fr; }
-          .admin-page-title { font-size: 1.5rem; }
-        }
+        @keyframes fadeSlideIn { from{opacity:0;transform:translateY(12px);}to{opacity:1;transform:translateY(0);} }
+        .stats-grid { display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem; }
+        .stat-card { padding:1.5rem;text-align:center; }
+        .stat-icon { font-size:1.75rem;margin-bottom:0.5rem; }
+        .stat-value { font-size:2.25rem;font-weight:900;color:#f0f6ff;line-height:1;margin-bottom:0.25rem; }
+        .stat-label { font-size:0.75rem;color:#4a5a72;font-weight:600;text-transform:uppercase;letter-spacing:0.06em; }
+        .tab-bar { display:flex;gap:0.25rem;margin-bottom:2rem;background:rgba(255,255,255,0.02);padding:0.25rem;border-radius:12px;border:1px solid rgba(99,162,255,0.08);flex-wrap:wrap; }
+        .tab-btn { flex:1;padding:0.625rem 1rem;border-radius:9px;border:none;background:transparent;color:#4a5a72;font-size:0.875rem;font-weight:600;cursor:pointer;transition:all 200ms;font-family:inherit;white-space:nowrap;min-width:120px; }
+        .tab-btn:hover { color:#94a3b8;background:rgba(255,255,255,0.04); }
+        .tab-btn--active { background:rgba(37,99,235,0.15)!important;color:#93c5fd!important;border:1px solid rgba(37,99,235,0.3); }
+        .admin-table-wrap { overflow-x:auto; }
+        .admin-table { width:100%;border-collapse:collapse;font-size:0.875rem; }
+        .admin-table th { text-align:left;padding:0.625rem 0.875rem;font-size:0.7rem;font-weight:700;color:#4a5a72;text-transform:uppercase;letter-spacing:0.08em;border-bottom:1px solid rgba(99,162,255,0.08); }
+        .admin-table td { padding:0.75rem 0.875rem;border-bottom:1px solid rgba(99,162,255,0.04);color:#94a3b8; }
+        .admin-table tr:last-child td { border-bottom:none; }
+        .admin-table tr:hover td { background:rgba(255,255,255,0.015); }
+        .card-section-title { font-size:0.875rem;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:1.25rem; }
+        .spinner { display:inline-block;border-style:solid;border-radius:50%;animation:spin 600ms linear infinite; }
+        @keyframes spin { to{transform:rotate(360deg);} }
       `}</style>
-    </div>
-  );
-}
-
-// ── Stat Card ─────────────────────────────────────────────────────────────────
-function StatCard({ icon, iconClass, value, label }) {
-  return (
-    <div className="stat-card">
-      <div className={`stat-icon ${iconClass}`}>{icon}</div>
-      <div>
-        <div className="stat-value">{value}</div>
-        <div className="stat-label">{label}</div>
-      </div>
-    </div>
-  );
-}
-
-// ── Form Field ────────────────────────────────────────────────────────────────
-function FormField({ label, id, value, onChange, placeholder, type = 'text', required = false }) {
-  return (
-    <div className="form-group">
-      <label htmlFor={id} className="form-label">{label}</label>
-      <input
-        id={id}
-        type={type}
-        className="form-input"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        required={required}
-      />
     </div>
   );
 }

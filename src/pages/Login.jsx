@@ -6,7 +6,7 @@
  */
 
 import { useState } from 'react';
-import db from '../utils/mockDb';
+import { auth } from '../utils/api';
 import ReCaptcha from '../components/ReCaptcha';
 
 export default function Login({ onLogin, onBack }) {
@@ -20,13 +20,14 @@ export default function Login({ onLogin, onBack }) {
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotSent, setForgotSent]         = useState(false);
   const [captchaVerified, setCaptchaVerified] = useState(false);
+  const [captchaToken, setCaptchaToken]       = useState(null);
   const [captchaKey, setCaptchaKey]           = useState(0);
   const [showCaptchaWarn, setShowCaptchaWarn] = useState(false);
 
   // ── Handlers ───────────────────────────────────────────────────────────────
 
   /** Handle login form submission */
-  const handleLogin = (e) => {
+  const handleLogin = async (e) => {
     e.preventDefault();
     setError('');
 
@@ -34,7 +35,7 @@ export default function Login({ onLogin, onBack }) {
     if (!password.trim()) { setError('Please enter your password.'); return; }
 
     // reCAPTCHA gate
-    if (!captchaVerified) {
+    if (!captchaVerified || !captchaToken) {
       setShowCaptchaWarn(true);
       return;
     }
@@ -42,19 +43,18 @@ export default function Login({ onLogin, onBack }) {
     setLoading(true);
     setShowCaptchaWarn(false);
 
-    // Simulate async API call delay
-    setTimeout(() => {
-      const user = db.authenticate(email.trim(), password);
+    try {
+      const data = await auth.login(email.trim(), password, captchaToken);
+      onLogin(data.user);
+    } catch (err) {
+      setError(err.message || 'Invalid email or password. Please try again.');
+      // Reset reCAPTCHA on failed attempt
+      setCaptchaVerified(false);
+      setCaptchaToken(null);
+      setCaptchaKey((k) => k + 1);
+    } finally {
       setLoading(false);
-      if (user) {
-        onLogin(user);
-      } else {
-        setError('Invalid email or password. Please try again.');
-        // Reset reCAPTCHA on failed attempt
-        setCaptchaVerified(false);
-        setCaptchaKey((k) => k + 1);
-      }
-    }, 700);
+    }
   };
 
   /** Handle forgot password submission (mocked) */
@@ -196,7 +196,11 @@ export default function Login({ onLogin, onBack }) {
             <div>
               <ReCaptcha
                 key={captchaKey}
-                onVerify={(token) => { setCaptchaVerified(!!token); if (token) setShowCaptchaWarn(false); }}
+                onVerify={(token) => {
+                  setCaptchaVerified(!!token);
+                  setCaptchaToken(token);
+                  if (token) setShowCaptchaWarn(false);
+                }}
                 theme="dark"
               />
               {showCaptchaWarn && (
