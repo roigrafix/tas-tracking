@@ -1,61 +1,95 @@
 # TAS — Track & Ship 🚢✈️
 
-> A modern, professional cargo and parcel tracking web application with role-based access control, real-time status updates, and an admin control panel.
+> A complete full-stack cargo and parcel tracking web application with a real Express.js backend, SQLite database, JWT authentication, server-side reCAPTCHA verification, role-based access control, and Server-Sent Events for real-time updates.
 
-**Live demo:** http://localhost:5173 (run locally — see below)
+**Repo:** https://github.com/roigrafix/tas-tracking
 
 ---
 
 ## ✨ Features
 
 ### 🌐 Public Tracking (no login required)
-- Anyone can track a parcel by entering a Tracking ID
-- reCAPTCHA v2 verification on every search to prevent bot abuse
-- Public shipments show full details (stepper, timeline, cargo info)
-- Restricted shipments prompt visitors to sign in
+- Anyone can look up a parcel by Tracking ID
+- Server-side **reCAPTCHA v2** verification on every request
+- Public shipments → full stepper, timeline, cargo details
+- Restricted shipments → "Sign in to check your access"
 
-### 🔐 Role-Based Authentication
+### 🔐 Full JWT Authentication
+- **Access tokens** (15 min) via `Authorization: Bearer` header
+- **Refresh tokens** (7 days) as `httpOnly` cookies — auto-rotate on use
+- SHA-256 hashed token storage (raw tokens never persisted)
+- Password hashing with **bcrypt** (cost 12)
+- Enumeration-safe login and forgot-password endpoints
+
+### 👤 Role-Based Access Control
 | Role | Access |
 |------|--------|
-| **Admin** | Full control — create/edit/delete shipments, manage RBAC |
-| **User** | View public shipments + any shipments explicitly granted |
+| **Admin** | Create/edit/delete shipments, manage RBAC grants, view stats |
+| **User** | View public + explicitly granted shipments |
 
-### 👤 User Dashboard
-- Tracking ID search with live validation
-- Visual 5-step shipment journey stepper with animated progress
-- Route details, cargo specs, vessel/flight info
-- Reverse-chronological activity log with timestamps
+### 📡 Real-time SSE Updates
+- `GET /api/shipments/:id/events` — Server-Sent Events stream
+- Admin status changes and log entries broadcast instantly to all subscribers
+- Frontend auto-subscribes via `EventSource`
 
-### 🛡️ Admin Dashboard
-- **Overview** — live stats (Active, Delivered, Processing, Total)
-- **Shipment Management** — create, update status, add log events, delete
-- **Access Control (RBAC)** — interactive user × shipment matrix; click to grant/revoke
-- **User Management** — view all accounts, roles, and shipment access counts
-- Toast notifications for all actions
-
-### 🎨 Design
-- Deep Space Navy dark theme with glassmorphism cards
-- Inter font, smooth animations, micro-interactions
-- Fully responsive (mobile, tablet, desktop)
-- Animated stepper, live-pulse status dots, floating orb background
+### 🛡️ Security
+- **Helmet.js** security headers
+- **CORS** with origin whitelist + credentials
+- **Rate limiting**: 20 req/15min on auth, 120 req/min on API
+- reCAPTCHA on every public-facing form (server-side verified)
+- `.env` secrets never committed; `.gitignore` enforced
 
 ---
 
 ## 🚀 Getting Started
 
+### Prerequisites
+- Node.js 18+
+- npm
+
+### 1. Clone & install
+
 ```bash
-# Clone the repo
 git clone https://github.com/roigrafix/tas-tracking.git
 cd tas-tracking
 
-# Install dependencies
+# Frontend dependencies
 npm install
 
-# Start the dev server
+# Backend dependencies
+cd server && npm install && cd ..
+```
+
+### 2. Configure environment
+
+```bash
+# Frontend (.env in project root)
+VITE_RECAPTCHA_SITE_KEY=your_site_key_here
+
+# Backend (server/.env — copy from server/.env.example)
+cp server/.env.example server/.env
+# Edit server/.env:
+#   JWT_ACCESS_SECRET=<64-char random hex>
+#   JWT_REFRESH_SECRET=<64-char random hex>
+#   RECAPTCHA_SECRET_KEY=your_secret_key
+#   RECAPTCHA_SKIP_VERIFY=true   ← for local dev only, remove in production
+```
+
+> Generate JWT secrets: `node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"`
+
+### 3. Start both servers
+
+**Terminal 1 — Backend (port 3001):**
+```bash
+cd server && node src/index.js
+```
+
+**Terminal 2 — Frontend (port 5173):**
+```bash
 npm run dev
 ```
 
-Open **http://localhost:5173**
+Open **http://localhost:5173** — the DB auto-seeds on first start.
 
 ---
 
@@ -78,70 +112,102 @@ Open **http://localhost:5173**
 
 ---
 
-## ⚙️ Environment Variables
+## 📡 API Reference
 
-Create a `.env` file in the project root:
-
-```env
-# Get your key at https://www.google.com/recaptcha/admin/create
-# Choose: reCAPTCHA v2 → "I'm not a robot" checkbox
-VITE_RECAPTCHA_SITE_KEY=your_site_key_here
-```
-
-> Without this, the app falls back to Google's **test key** (`6LeIxAcT...`) which always passes — only use for local development.
-
----
-
-## 🏗️ Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Frontend | React 18 + Vite |
-| Styling | Vanilla CSS (custom design system) |
-| Auth / State | LocalStorage-backed mock DB |
-| reCAPTCHA | `react-google-recaptcha` v2 |
-| Icons | Emoji + inline SVG |
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET`  | `/api/health` | None | Health check |
+| `POST` | `/api/auth/login` | None + captcha | Login → access token + refresh cookie |
+| `POST` | `/api/auth/refresh` | Cookie | Rotate refresh token |
+| `POST` | `/api/auth/logout` | Bearer | Revoke refresh token |
+| `POST` | `/api/auth/forgot` | None | Password reset (enumeration-safe) |
+| `POST` | `/api/public/track` | None + captcha | Public shipment lookup |
+| `GET`  | `/api/shipments` | Admin | List all shipments |
+| `POST` | `/api/shipments` | Admin | Create shipment |
+| `GET`  | `/api/shipments/:id` | RBAC | Get shipment + logs |
+| `PATCH`| `/api/shipments/:id` | Admin | Update details/status |
+| `DELETE`| `/api/shipments/:id` | Admin | Delete shipment |
+| `POST` | `/api/shipments/:id/logs` | Admin | Add log entry |
+| `GET`  | `/api/shipments/:id/events` | RBAC | SSE real-time stream |
+| `PATCH`| `/api/shipments/:id/public` | Admin | Toggle public flag |
+| `GET`  | `/api/shipments/stats` | Admin | Dashboard stats |
+| `GET`  | `/api/access` | Admin | All RBAC grants |
+| `POST` | `/api/access/grant` | Admin | Grant user access |
+| `POST` | `/api/access/revoke` | Admin | Revoke user access |
+| `GET`  | `/api/users` | Admin | List all users |
 
 ---
 
 ## 📁 Project Structure
 
 ```
-src/
-├── App.jsx                  # Root router (Public → Login → Dashboard)
-├── index.css                # Full design system (tokens, components, animations)
-├── main.jsx                 # Entry point
-├── components/
-│   └── ReCaptcha.jsx        # Real Google reCAPTCHA v2 wrapper
-├── pages/
-│   ├── PublicTrack.jsx      # Public landing + tracking page
-│   ├── Login.jsx            # Authentication page
-│   ├── UserDashboard.jsx    # Standard user tracking view
-│   └── AdminDashboard.jsx   # Full admin control panel
-└── utils/
-    └── mockDb.js            # LocalStorage DB mock (users, shipments, RBAC)
-
-database_architecture.md     # Full backend API & DB design spec (PostgreSQL, REST, SSE, Web Push)
+tas-tracking/
+├── index.html
+├── vite.config.js           ← Proxies /api → localhost:3001
+├── .env                     ← VITE_RECAPTCHA_SITE_KEY (gitignored)
+│
+├── src/                     ← React + Vite frontend
+│   ├── App.jsx              ← Routing + session restore on mount
+│   ├── index.css            ← Full dark design system
+│   ├── components/
+│   │   └── ReCaptcha.jsx    ← Real react-google-recaptcha v2
+│   ├── pages/
+│   │   ├── PublicTrack.jsx  ← Public landing + tracking
+│   │   ├── Login.jsx        ← JWT auth + reCAPTCHA
+│   │   ├── UserDashboard.jsx
+│   │   └── AdminDashboard.jsx
+│   └── utils/
+│       ├── api.js           ← Centralized fetch client (auto-refresh JWT)
+│       └── mockDb.js        ← Legacy (no longer used)
+│
+└── server/                  ← Express.js backend
+    ├── .env                 ← Secrets (gitignored)
+    ├── .env.example         ← Template
+    ├── package.json
+    └── src/
+        ├── index.js         ← App entry, middleware, routes
+        ├── db/
+        │   ├── database.js  ← sql.js SQLite + schema + persistence
+        │   └── seed.js      ← Demo users, shipments, logs, access
+        ├── middleware/
+        │   ├── auth.js      ← JWT Bearer + optionalAuth + requireAdmin
+        │   └── recaptcha.js ← Server-side Google reCAPTCHA verify
+        ├── routes/
+        │   ├── auth.js      ← Login, refresh, logout, forgot
+        │   ├── shipments.js ← CRUD + SSE + logs + stats
+        │   ├── access.js    ← RBAC grant/revoke
+        │   ├── users.js     ← User listing
+        │   └── public.js    ← Public track (no auth)
+        └── utils/
+            └── jwt.js       ← Token gen, verify, revoke, cookies
 ```
 
 ---
 
-## 🗄️ Backend Architecture
+## 🗄️ Database Schema (SQLite)
 
-See [`database_architecture.md`](./database_architecture.md) for a full production-ready backend design:
+| Table | Key Fields |
+|-------|-----------|
+| `users` | id, name, email, password_hash, role, is_active |
+| `shipments` | id, description, status, origin, destination, vessel, is_public |
+| `shipment_logs` | id, shipment_id, event, location, note, logged_at |
+| `shipment_access` | user_id, shipment_id, granted_by (composite PK) |
+| `refresh_tokens` | token_hash, user_id, expires_at |
 
-- **PostgreSQL schema** — `users`, `shipments`, `shipment_logs`, `shipment_access`, `push_subscriptions`
-- **REST API** — all endpoints with RBAC middleware pseudocode
-- **Real-time updates** — Server-Sent Events (SSE) and Socket.IO patterns
-- **Web Push notifications** — Service Worker + FCM integration
-- **Firebase Firestore** — alternative schema + security rules
-- **Security checklist** — bcrypt, JWT, HTTPS, rate limiting, Helmet.js
+The SQLite file is saved to `server/data/tas.db` (gitignored).
 
 ---
 
-## 📜 License
+## 🚢 Production Deployment
 
-MIT — free to use, modify, and distribute.
+1. **Swap SQLite → PostgreSQL** — replace `sql.js` with `pg` + connection pool
+2. **Set `NODE_ENV=production`** — removes dev bypass warning
+3. **Remove `RECAPTCHA_SKIP_VERIFY`** — real verification enforced
+4. **Set strong JWT secrets** — 64+ character random hex strings
+5. **Deploy backend** on Railway / Render / Fly.io / EC2
+6. **Deploy frontend** on Vercel / Netlify / Firebase Hosting
+7. **Update `FRONTEND_ORIGIN`** in server `.env` to your real domain
+8. **Configure `VITE_RECAPTCHA_SITE_KEY`** in your deployment platform
 
 ---
 
