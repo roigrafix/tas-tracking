@@ -8,8 +8,8 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "start": "cd server && node src/index.js",
-    "build:full": "npm install --include=dev && npm run build && cd server && npm install --omit=dev"
+    "start": "node server/src/index.js",
+    "build:full": "NODE_ENV=development npm install && npm run build && npm --prefix server install --omit=dev"
   },
   "dependencies": {
     "react": "^19.2.6",
