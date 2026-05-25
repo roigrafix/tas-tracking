@@ -5,17 +5,34 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
+    // Development only: proxy /api to the local Express backend
     proxy: {
-      // Proxy all /api requests to the Express backend during development
       '/api': {
-        target:      'http://localhost:3001',
+        target: 'http://localhost:3001',
         changeOrigin: true,
-        secure:       false,
-        // SSE needs these settings to stream properly
+        secure: false,
         configure: (proxy) => {
           proxy.on('proxyReq', (proxyReq) => {
             proxyReq.setHeader('connection', 'keep-alive');
           });
+        },
+      },
+    },
+  },
+  build: {
+    // Output to dist/ (Express serves this in production)
+    outDir: 'dist',
+    // Generate source maps for easier debugging in production
+    sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules/react') || id.includes('node_modules/react-dom')) {
+            return 'react';
+          }
+          if (id.includes('react-google-recaptcha')) {
+            return 'recaptcha';
+          }
         },
       },
     },

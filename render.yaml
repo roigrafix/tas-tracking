@@ -1,0 +1,44 @@
+# render.yaml — TAS Track & Ship deployment config
+# ===================================================
+# Deploy this repo on Render: https://dashboard.render.com/new/web
+# Render reads this file and configures the service automatically.
+
+services:
+  - type: web
+    name: tas-tracking
+    runtime: node
+    region: oregon           # change to: frankfurt | singapore | ohio as needed
+    plan: free               # upgrade to starter ($7/mo) for persistent disk
+
+    # Build: install frontend deps, build Vite app, install server deps
+    buildCommand: npm install && npm run build && cd server && npm install
+
+    # Start: run Express (serves API + built React app)
+    startCommand: npm start
+
+    # Health check — Render will restart if this stops returning 200
+    healthCheckPath: /api/health
+
+    # Environment variables — set secret values in Render dashboard
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      - key: PORT
+        value: 3001
+
+      # Database path — on free plan this is ephemeral (resets on redeploy).
+      # Upgrade to Starter + add a Disk to persist data.
+      - key: DB_PATH
+        value: ./data/tas.db
+
+      # ── Set these in Render Dashboard (not here, to keep them secret) ──
+      # JWT_ACCESS_SECRET    → 64-char random hex
+      # JWT_REFRESH_SECRET   → 64-char random hex
+      # RECAPTCHA_SECRET_KEY → your reCAPTCHA v2 secret key
+      # FRONTEND_ORIGIN      → https://your-app.onrender.com
+      - key: JWT_ACCESS_SECRET
+        generateValue: true    # Render generates a random value automatically
+
+      - key: JWT_REFRESH_SECRET
+        generateValue: true

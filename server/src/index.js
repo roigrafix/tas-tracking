@@ -85,6 +85,18 @@ app.use('/api/shipments', shipmentsRoutes);
 app.use('/api/access',    accessRoutes);
 app.use('/api/users',     usersRoutes);
 
+// ── Serve built React frontend in production ──────────────────────────────────
+// In development, Vite dev server handles the frontend (port 5173).
+// In production, Express serves the built dist/ folder from the project root.
+if (process.env.NODE_ENV === 'production') {
+  const distPath = path.join(__dirname, '../../dist');
+  app.use(express.static(distPath));
+  // SPA fallback — all non-API routes return index.html
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+}
+
 // ── Global Error Handler ──────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
