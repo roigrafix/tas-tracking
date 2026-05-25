@@ -115,16 +115,32 @@ export const auth = {
     return data;
   },
 
-  /** Refresh the access token using the httpOnly refresh cookie. */
+  /** Refresh the access token using the httpOnly refresh cookie.
+   * Calls fetchApi with _retry=true to prevent recursive refresh loops.
+   */
   async refresh() {
     try {
-      const data = await post('/auth/refresh', {});
+      // AbortController gives a 5s timeout — prevents infinite hang on first load
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+
+      // _retry=true is CRITICAL — prevents fetchApi from calling auth.refresh()
+      // again when this request itself gets a 401 (no cookie on first load)
+      const data = await fetchApi('/auth/refresh', {
+        method:  'POST',
+        body:    JSON.stringify({}),
+        signal:  controller.signal,
+      }, true); // <-- _retry = true, breaks the infinite loop
+
+      clearTimeout(timer);
+
       if (data.accessToken) {
         setAccessToken(data.accessToken);
         return data;
       }
       return null;
     } catch {
+      // 401 (no cookie), timeout, or network error — all silently return null
       clearAccessToken();
       return null;
     }
