@@ -10,8 +10,8 @@ services:
     region: oregon           # change to: frankfurt | singapore | ohio as needed
     plan: free               # upgrade to starter ($7/mo) for persistent disk
 
-    # Build: install frontend deps, build Vite app, install server deps
-    buildCommand: npm install && npm run build && cd server && npm install
+    # Build: install ALL deps (including devDeps for vite), build frontend, then install server deps
+    buildCommand: npm install --include=dev && npm run build && cd server && npm install --omit=dev
 
     # Start: run Express (serves API + built React app)
     startCommand: npm start
